@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 * fix: properly detect and filter out unsupported fonts (https://github.com/zellij-org/zellij/pull/5934)
 * fix: apps querying the whole color palette (eg. notcurses) stalling for seconds over SSH (https://github.com/zellij-org/zellij/pull/5917)
 * fix: plugins not receiving a pane's program status records when a record changes without changing the pane's status (https://github.com/zellij-org/zellij/pull/5906)
+* fix: pane boundaries next to a borderless plugin when pane frames are off (https://github.com/zellij-org/zellij/pull/5874)
 
 ## [0.46.0] - 2026-11-11
 * (BREAKING CHANGE zellij-tile) `NestedListItem::new` now require a `Text` instead of a `&str` (https://github.com/zellij-org/zellij/pull/5611)
