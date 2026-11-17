@@ -17700,6 +17700,81 @@ fn a_session_with_a_collapsed_pane_serializes_as_if_the_pane_were_expanded() {
     assert_eq!(collapsed, expanded);
 }
 
+#[test]
+fn a_session_with_a_collapsed_pane_beside_a_fixed_pane_serializes_as_if_the_pane_were_expanded() {
+    // what a sidebar plugin with a wide and a narrow face mounts: two columns of a fixed
+    // width beside the panes, one of them collapsed at any time. The one that stays cannot
+    // grow over the other's columns, it slides over them
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    for (widths, collapsed_column) in [([32, 4], 0), ([32, 4], 1), ([4, 32], 0)] {
+        let mut layout = TiledPaneLayout::default();
+        layout.children_split_direction = SplitDirection::Vertical;
+        layout.children = widths
+            .iter()
+            .map(|width| {
+                let mut column = TiledPaneLayout::default();
+                column.split_size = Some(zellij_utils::input::layout::SplitSize::Fixed(*width));
+                column
+            })
+            .chain(std::iter::once(TiledPaneLayout::default()))
+            .collect();
+        let mut screen = create_new_screen(size, true, true);
+        screen
+            .new_tab(0, (vec![], vec![]), None, Some(1))
+            .expect("TEST");
+        screen
+            .apply_layout(
+                layout,
+                vec![],
+                vec![(1, None), (2, None), (3, None)],
+                vec![],
+                HashMap::new(),
+                0,
+                true,
+                (1, false),
+                None,
+            )
+            .expect("TEST");
+        let columns_from_the_left = {
+            let tab = screen.get_active_tab_mut(1).unwrap();
+            let mut columns: Vec<(usize, PaneId)> = tab
+                .get_tiled_panes()
+                .map(|(pane_id, pane)| (pane.position_and_size().x, *pane_id))
+                .collect();
+            columns.sort_by_key(|(x, _)| *x);
+            tab.focus_pane_with_id(columns[2].1, false, false, 1)
+                .unwrap();
+            columns
+        };
+        let serialize = |screen: &Screen| {
+            zellij_utils::session_serialization::serialize_session_layout(
+                screen.get_layout_metadata(None, None).into(),
+            )
+        };
+        let expanded = serialize(&screen).expect("the expanded session should serialize");
+        assert!(
+            expanded.0.contains("size=32") && expanded.0.contains("size=4"),
+            "both fixed columns should be in the layout to begin with: {}",
+            expanded.0
+        );
+
+        screen
+            .get_active_tab_mut(1)
+            .unwrap()
+            .set_pane_collapsed(columns_from_the_left[collapsed_column].1, true);
+        let collapsed =
+            serialize(&screen).expect("a collapsed pane should not break serialization");
+
+        assert_eq!(
+            collapsed, expanded,
+            "columns of {widths:?} with number {collapsed_column} collapsed"
+        );
+    }
+}
+
 fn rendered_payload_for_client(
     server_receiver: &ServerReceiver,
     client_id: ClientId,

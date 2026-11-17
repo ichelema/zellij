@@ -3140,32 +3140,34 @@ impl TiledPanes {
                 None => standalone_panes.push((*pane_id, geom)),
             }
         }
-        for (pane_id, geom) in standalone_panes {
-            let mut expanded = geom;
-            for space in collapsed_spaces {
-                if let Some(shrunk) = shrink_off_collapsed_space(expanded, space) {
-                    expanded = shrunk;
-                }
-            }
+        // a stack takes part as the one pane it is in the layout
+        let stacks: Vec<(Vec<(PaneId, PaneGeom)>, PaneGeom)> = stacks
+            .into_values()
+            .filter_map(|mut members| {
+                members.sort_by_key(|(_, geom)| geom.y);
+                let stack_geom = bounding_geom_of_stack(&members)?;
+                Some((members, stack_geom))
+            })
+            .collect();
+        let mut expanded: Vec<PaneGeom> = standalone_panes
+            .iter()
+            .map(|(_, geom)| *geom)
+            .chain(stacks.iter().map(|(_, stack_geom)| *stack_geom))
+            .collect();
+        for space in collapsed_spaces {
+            take_neighbors_off_collapsed_space(&mut expanded, space);
+        }
+        let (expanded_panes, expanded_stacks) = expanded.split_at(standalone_panes.len());
+        for ((pane_id, geom), expanded) in standalone_panes.iter().zip(expanded_panes) {
             if expanded != geom {
-                geoms.insert(pane_id, expanded);
+                geoms.insert(*pane_id, *expanded);
             }
         }
-        for (_stack_id, mut members) in stacks {
-            members.sort_by_key(|(_, geom)| geom.y);
-            let Some(stack_geom) = bounding_geom_of_stack(&members) else {
-                continue;
-            };
-            let mut expanded = stack_geom;
-            for space in collapsed_spaces {
-                if let Some(shrunk) = shrink_off_collapsed_space(expanded, space) {
-                    expanded = shrunk;
-                }
-            }
+        for ((members, stack_geom), expanded) in stacks.iter().zip(expanded_stacks) {
             if expanded == stack_geom {
                 continue;
             }
-            for (pane_id, geom) in fit_stack_members_into(&members, expanded) {
+            for (pane_id, geom) in fit_stack_members_into(members, *expanded) {
                 geoms.insert(pane_id, geom);
             }
         }
@@ -3499,31 +3501,202 @@ pub fn pane_geom_is_inside_viewport(viewport: &Viewport, geom: &PaneGeom) -> boo
         && geom.x + geom.cols.as_usize() <= viewport.x + viewport.cols
 }
 
-fn shrink_off_collapsed_space(geom: PaneGeom, space: &PaneGeom) -> Option<PaneGeom> {
-    let cols = (geom.x, geom.x + geom.cols.as_usize());
-    let rows = (geom.y, geom.y + geom.rows.as_usize());
-    let space_cols = (space.x, space.x + space.cols.as_usize());
-    let space_rows = (space.y, space.y + space.rows.as_usize());
-    let overlaps = cols.0 < space_cols.1
-        && space_cols.0 < cols.1
-        && rows.0 < space_rows.1
-        && space_rows.0 < rows.1;
-    if !overlaps {
+/// Takes the panes that hold a collapsed pane's space off it again, so that they are where
+/// they were before it collapsed.
+///
+/// A pane that can be resized grew over the space, and is shrunk back off it. A pane of a
+/// fixed size could not grow: the solve slid it towards the space instead, along with
+/// everything between it and the pane that did grow. Those are moved back past the space,
+/// each one pushing the next, until the pane that grew makes room for them.
+fn take_neighbors_off_collapsed_space(geoms: &mut [PaneGeom], space: &PaneGeom) {
+    let shrink_off_space = |geoms: &mut [PaneGeom], index: usize, direction| {
+        if let Some(shrunk) = shrink_span_off(
+            span_along(&geoms[index], direction),
+            span_along(space, direction),
+        ) {
+            geoms[index] = with_span_along(geoms[index], direction, shrunk);
+        }
+    };
+    let mut slid_into_space = vec![];
+    for index in 0..geoms.len() {
+        let Some((direction, towards_end)) = way_off_collapsed_space(geoms, index, space) else {
+            continue;
+        };
+        if is_fixed_along(&geoms[index], direction) {
+            slid_into_space.push((index, direction, towards_end));
+        } else {
+            shrink_off_space(geoms, index, direction);
+        }
+    }
+    // the furthest from the space goes first: each one that moves back pushes those before
+    // it further on, which is what keeps them in their order
+    slid_into_space.sort_by_key(|(index, direction, towards_end)| {
+        let start = span_along(&geoms[*index], *direction).0 as isize;
+        if *towards_end {
+            -start
+        } else {
+            start
+        }
+    });
+    for (index, direction, towards_end) in slid_into_space {
+        let mut moved = geoms.to_vec();
+        if move_pane_past(&mut moved, index, space, space, direction, towards_end) {
+            geoms.copy_from_slice(&moved);
+        } else {
+            // nothing lined up with the space can make room for it: it loses the part of it
+            // that is on the space, rather than be left on top of the collapsed pane
+            shrink_off_space(geoms, index, direction);
+        }
+    }
+}
+
+/// Which way a pane gets off a collapsed pane's space, if it is on it at all: along which
+/// direction, and whether towards the end of it.
+fn way_off_collapsed_space(
+    geoms: &[PaneGeom],
+    index: usize,
+    space: &PaneGeom,
+) -> Option<(SplitDirection, bool)> {
+    let geom = &geoms[index];
+    if !geoms_overlap(geom, space) {
         return None;
     }
-    let mut shrunk = geom;
-    if space_cols.0 <= cols.0 && cols.1 <= space_cols.1 {
-        let (start, end) = shrink_span_off(rows, space_rows)?;
-        shrunk.y = start;
-        shrunk.rows.set_inner(end - start);
-    } else if space_rows.0 <= rows.0 && rows.1 <= space_rows.1 {
-        let (start, end) = shrink_span_off(cols, space_cols)?;
-        shrunk.x = start;
-        shrunk.cols.set_inner(end - start);
+    let room_is_beyond_space = |direction: SplitDirection, towards_end: bool| {
+        let (space_start, space_end) = span_along(space, direction);
+        geoms.iter().any(|other| {
+            let (start, end) = span_along(other, direction);
+            let reaches_beyond_space = if towards_end {
+                end > space_end
+            } else {
+                start < space_start
+            };
+            reaches_beyond_space
+                && !is_fixed_along(other, direction)
+                && is_lined_up_with(other, space, direction)
+        })
+    };
+    let within_space_columns = is_lined_up_with(geom, space, SplitDirection::Vertical);
+    let within_space_rows = is_lined_up_with(geom, space, SplitDirection::Horizontal);
+    match (within_space_columns, within_space_rows) {
+        // above or below the space, having taken its rows
+        (true, false) => Some((SplitDirection::Vertical, geom.y >= space.y)),
+        // beside the space, having taken its columns
+        (false, true) => Some((SplitDirection::Horizontal, geom.x >= space.x)),
+        // wholly within the space: this pane did not grow over it but slid into it, and
+        // goes back towards the pane that grew in its stead
+        (true, true) => [SplitDirection::Horizontal, SplitDirection::Vertical]
+            .into_iter()
+            .filter(|direction| is_fixed_along(geom, *direction))
+            .flat_map(|direction| [(direction, true), (direction, false)])
+            .find(|(direction, towards_end)| room_is_beyond_space(*direction, *towards_end)),
+        (false, false) => None,
+    }
+}
+
+/// Moves a pane past `obstacle` along `direction`, and whatever it lands on out of its way
+/// in turn: a pane that can be resized makes room for it, one of a fixed size moves on past
+/// it.
+///
+/// Says whether this could be done with the panes lined up with `space`. When it could not,
+/// `geoms` is left partly changed and is not to be used.
+fn move_pane_past(
+    geoms: &mut [PaneGeom],
+    index: usize,
+    obstacle: &PaneGeom,
+    space: &PaneGeom,
+    direction: SplitDirection,
+    towards_end: bool,
+) -> bool {
+    let (start, end) = span_along(&geoms[index], direction);
+    let (obstacle_start, obstacle_end) = span_along(obstacle, direction);
+    let size = end - start;
+    let far_edge = geoms
+        .iter()
+        .map(|geom| span_along(geom, direction).1)
+        .max()
+        .unwrap_or(end);
+    let start = if towards_end {
+        Some(obstacle_end).filter(|start| start + size <= far_edge)
     } else {
-        return None;
+        obstacle_start.checked_sub(size)
+    };
+    let Some(start) = start else {
+        return false;
+    };
+    let moved = with_span_along(geoms[index], direction, (start, start + size));
+    geoms[index] = moved;
+    for other in 0..geoms.len() {
+        if other == index || !geoms_overlap(&geoms[other], &moved) {
+            continue;
+        }
+        if !is_lined_up_with(&geoms[other], space, direction) {
+            return false;
+        }
+        let (other_start, other_end) = span_along(&geoms[other], direction);
+        let room_left = if towards_end {
+            (start + size, other_end)
+        } else {
+            (other_start, start)
+        };
+        if !is_fixed_along(&geoms[other], direction) && room_left.0 < room_left.1 {
+            geoms[other] = with_span_along(geoms[other], direction, room_left);
+        } else if !move_pane_past(geoms, other, &moved, space, direction, towards_end) {
+            return false;
+        }
     }
-    Some(shrunk)
+    true
+}
+
+/// Where a pane starts and ends along `direction`: its columns for `Horizontal` and its rows
+/// for `Vertical`, as in the resizer.
+fn span_along(geom: &PaneGeom, direction: SplitDirection) -> (usize, usize) {
+    match direction {
+        SplitDirection::Horizontal => (geom.x, geom.x + geom.cols.as_usize()),
+        SplitDirection::Vertical => (geom.y, geom.y + geom.rows.as_usize()),
+    }
+}
+
+fn with_span_along(
+    mut geom: PaneGeom,
+    direction: SplitDirection,
+    (start, end): (usize, usize),
+) -> PaneGeom {
+    match direction {
+        SplitDirection::Horizontal => {
+            geom.x = start;
+            geom.cols.set_inner(end - start);
+        },
+        SplitDirection::Vertical => {
+            geom.y = start;
+            geom.rows.set_inner(end - start);
+        },
+    }
+    geom
+}
+
+fn is_fixed_along(geom: &PaneGeom, direction: SplitDirection) -> bool {
+    match direction {
+        SplitDirection::Horizontal => geom.cols.is_fixed(),
+        SplitDirection::Vertical => geom.rows.is_fixed(),
+    }
+}
+
+/// Whether a pane lies within the stretch of the tab that a collapsed pane's space runs
+/// along in `direction`: the panes it traded space with in that direction all do.
+fn is_lined_up_with(geom: &PaneGeom, space: &PaneGeom, direction: SplitDirection) -> bool {
+    let (start, end) = span_along(geom, !direction);
+    let (space_start, space_end) = span_along(space, !direction);
+    space_start <= start && end <= space_end
+}
+
+fn geoms_overlap(geom: &PaneGeom, other: &PaneGeom) -> bool {
+    [SplitDirection::Horizontal, SplitDirection::Vertical]
+        .into_iter()
+        .all(|direction| {
+            let (start, end) = span_along(geom, direction);
+            let (other_start, other_end) = span_along(other, direction);
+            start < other_end && other_start < end
+        })
 }
 
 fn shrink_span_off(
@@ -3546,6 +3719,10 @@ fn bounding_geom_of_stack(members: &[(PaneId, PaneGeom)]) -> Option<PaneGeom> {
     let (_, first) = members.first()?;
     let (_, last) = members.last()?;
     let mut bounding = *first;
+    // a stack can be resized like the one member of it that can
+    if let Some((_, flexible)) = members.iter().find(|(_, geom)| !geom.rows.is_fixed()) {
+        bounding.rows = flexible.rows;
+    }
     bounding
         .rows
         .set_inner((last.y + last.rows.as_usize()).saturating_sub(first.y));

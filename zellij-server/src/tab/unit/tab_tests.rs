@@ -20997,6 +20997,208 @@ fn a_collapsed_bar_under_a_stack_is_serialized_as_if_it_were_expanded() {
     assert_eq!(tiled_geoms_as_serialized(&tab), before);
 }
 
+/// Panes side by side, or one above the other, each of the fixed size asked for or sharing
+/// what is left over for `None`. Returns them in the order they are laid out in.
+fn tab_with_panes_in_a_line(
+    direction: SplitDirection,
+    sizes: &[Option<usize>],
+) -> (Tab, Vec<PaneId>) {
+    let mut layout = TiledPaneLayout::default();
+    layout.children_split_direction = direction;
+    layout.children = sizes
+        .iter()
+        .map(|size| {
+            let mut pane = TiledPaneLayout::default();
+            pane.split_size = size.map(SplitSize::Fixed);
+            pane
+        })
+        .collect();
+    let tab = create_new_tab_with_layout(
+        Size {
+            cols: 121,
+            rows: 20,
+        },
+        layout,
+    );
+    let mut panes: Vec<(usize, usize, PaneId)> = tab
+        .get_tiled_panes()
+        .map(|(pane_id, pane)| {
+            let geom = pane.position_and_size();
+            (geom.x, geom.y, *pane_id)
+        })
+        .collect();
+    panes.sort_by_key(|(x, y, _)| (*x, *y));
+    let panes = panes.into_iter().map(|(_, _, pane_id)| pane_id).collect();
+    (tab, panes)
+}
+
+#[test]
+fn a_fixed_pane_that_slid_into_a_collapsed_panes_space_is_serialized_back_in_its_own_place() {
+    // a sidebar and a narrow strip next to it, both of a fixed width, left of the pane that
+    // takes the rest: with the sidebar collapsed the strip cannot grow over its columns, it
+    // slides to the left edge and ends up wholly within them
+    let (mut tab, columns) =
+        tab_with_panes_in_a_line(SplitDirection::Vertical, &[Some(32), Some(4), None]);
+    let before = all_tiled_geoms(&tab);
+
+    tab.set_pane_collapsed(columns[0], true);
+
+    assert_eq!(
+        (
+            geom_of(&tab, columns[1]).x,
+            geom_of(&tab, columns[2]).x,
+            geom_of(&tab, columns[2]).cols.as_usize()
+        ),
+        (0, 4, 117),
+        "the strip should have slid to the left edge and the last pane grown up to it"
+    );
+    assert_eq!(tiled_geoms_as_serialized(&tab), before);
+}
+
+#[test]
+fn a_fixed_pane_that_slid_over_a_collapsed_panes_space_is_serialized_at_its_own_size() {
+    // the same two the other way around: with the narrow strip collapsed the sidebar slides
+    // over its columns, and is too wide to fit within them
+    let (mut tab, columns) =
+        tab_with_panes_in_a_line(SplitDirection::Vertical, &[Some(4), Some(32), None]);
+    let before = all_tiled_geoms(&tab);
+
+    tab.set_pane_collapsed(columns[0], true);
+
+    assert_eq!(geom_of(&tab, columns[1]).x, 0);
+    assert_eq!(tiled_geoms_as_serialized(&tab), before);
+}
+
+#[test]
+fn a_collapsed_pane_between_a_fixed_pane_and_the_pane_that_grew_is_serialized_as_if_it_were_expanded(
+) {
+    let (mut tab, columns) =
+        tab_with_panes_in_a_line(SplitDirection::Vertical, &[Some(32), Some(4), None]);
+    let before = all_tiled_geoms(&tab);
+
+    tab.set_pane_collapsed(columns[1], true);
+
+    assert_ne!(all_tiled_geoms(&tab), before);
+    assert_eq!(tiled_geoms_as_serialized(&tab), before);
+}
+
+#[test]
+fn fixed_panes_that_slid_towards_the_end_of_the_tab_are_serialized_back_in_their_own_place() {
+    // the mirror image, with the pane that grows on the left: what slides goes right
+    for (sizes, collapsed) in [
+        ([None, Some(4), Some(32)], 2),
+        ([None, Some(32), Some(4)], 2),
+        ([None, Some(4), Some(32)], 1),
+    ] {
+        let (mut tab, columns) = tab_with_panes_in_a_line(SplitDirection::Vertical, &sizes);
+        let before = all_tiled_geoms(&tab);
+
+        tab.set_pane_collapsed(columns[collapsed], true);
+
+        assert_ne!(all_tiled_geoms(&tab), before);
+        assert_eq!(
+            tiled_geoms_as_serialized(&tab),
+            before,
+            "columns of {sizes:?} with number {collapsed} collapsed"
+        );
+    }
+}
+
+#[test]
+fn fixed_panes_that_slid_into_a_collapsed_panes_space_are_serialized_in_their_order() {
+    let (mut tab, columns) = tab_with_panes_in_a_line(
+        SplitDirection::Vertical,
+        &[Some(32), Some(4), Some(10), None],
+    );
+    let before = all_tiled_geoms(&tab);
+
+    tab.set_pane_collapsed(columns[0], true);
+
+    assert_eq!(
+        (geom_of(&tab, columns[1]).x, geom_of(&tab, columns[2]).x),
+        (0, 4),
+        "both fixed panes should have slid into the collapsed pane's space"
+    );
+    assert_eq!(tiled_geoms_as_serialized(&tab), before);
+}
+
+#[test]
+fn fixed_rows_that_slid_into_a_collapsed_bars_space_are_serialized_back_in_their_own_place() {
+    // two bars at the top or the bottom of the tab: when the outer one collapses the inner
+    // one takes its rows, without growing
+    for (sizes, collapsed) in [
+        ([Some(1), Some(1), None], 0),
+        ([Some(1), Some(2), None], 0),
+        ([None, Some(1), Some(1)], 2),
+        ([None, Some(2), Some(1)], 2),
+    ] {
+        let (mut tab, rows) = tab_with_panes_in_a_line(SplitDirection::Horizontal, &sizes);
+        let before = all_tiled_geoms(&tab);
+
+        tab.set_pane_collapsed(rows[collapsed], true);
+
+        assert_ne!(all_tiled_geoms(&tab), before);
+        assert_eq!(
+            tiled_geoms_as_serialized(&tab),
+            before,
+            "rows of {sizes:?} with number {collapsed} collapsed"
+        );
+    }
+}
+
+#[test]
+fn a_fixed_pane_with_no_room_to_move_back_into_is_serialized_off_the_collapsed_panes_space() {
+    // a narrow strip and a sidebar, both of a fixed width, above a pane as wide as the two
+    // of them and beside one that takes the rest: with the strip collapsed, the pane that
+    // grows reaches below the sidebar too, and cannot make room for just the sidebar
+    let fixed = |size| {
+        let mut pane = TiledPaneLayout::default();
+        pane.split_size = Some(SplitSize::Fixed(size));
+        pane
+    };
+    let mut strip_and_sidebar = TiledPaneLayout::default();
+    strip_and_sidebar.children_split_direction = SplitDirection::Vertical;
+    strip_and_sidebar.children = vec![fixed(4), fixed(32)];
+    let mut left = TiledPaneLayout::default();
+    left.children_split_direction = SplitDirection::Horizontal;
+    left.children = vec![strip_and_sidebar, TiledPaneLayout::default()];
+    let mut layout = TiledPaneLayout::default();
+    layout.children_split_direction = SplitDirection::Vertical;
+    layout.children = vec![left, TiledPaneLayout::default()];
+    let mut tab = create_new_tab_with_layout(
+        Size {
+            cols: 121,
+            rows: 20,
+        },
+        layout,
+    );
+    let pane_at = |x, y| {
+        all_tiled_geoms(&tab)
+            .into_iter()
+            .find(|(_, geom)| (geom.x, geom.y) == (x, y))
+            .map(|(pane_id, _)| pane_id)
+            .unwrap()
+    };
+    let (strip, sidebar) = (pane_at(0, 0), pane_at(4, 0));
+
+    tab.set_pane_collapsed(strip, true);
+
+    assert_eq!(
+        geom_of(&tab, sidebar).x,
+        0,
+        "the sidebar should have slid over the strip's columns"
+    );
+    let serialized = tiled_geoms_as_serialized(&tab);
+    assert_eq!(
+        (serialized[&strip].x, serialized[&strip].cols.as_usize()),
+        (0, 4)
+    );
+    assert!(
+        serialized[&sidebar].x >= 4,
+        "the sidebar should not be serialized on top of the strip"
+    );
+}
+
 #[test]
 fn nothing_is_overridden_for_serialization_when_no_pane_is_collapsed() {
     let tab = tab_with_a_pane_above_a_pane();
@@ -21540,6 +21742,25 @@ fn a_hidden_bar_is_serialized_as_if_it_were_shown() {
 
     assert_ne!(all_tiled_geoms(&tab), before);
     assert_eq!(tiled_geoms_as_serialized(&tab), before);
+}
+
+#[test]
+fn showing_a_hidden_bar_moves_a_fixed_pane_that_slid_into_its_row_back_out_of_it() {
+    let (mut tab, rows) =
+        tab_with_panes_in_a_line(SplitDirection::Horizontal, &[None, Some(2), Some(1)]);
+    let before = all_tiled_geoms(&tab);
+    set_bar_hidden(&mut tab, rows[2], true);
+    assert_eq!(
+        geom_of(&tab, rows[1]).y,
+        18,
+        "the bar above the hidden one should have slid down into its row"
+    );
+
+    // only what showing the bar does by itself, ahead of the relayout that follows it: the
+    // bar has to find its row free to come back to
+    tab.tiled_panes.set_bar_hidden(rows[2], false);
+
+    assert_eq!(all_tiled_geoms(&tab), before);
 }
 
 #[test]
